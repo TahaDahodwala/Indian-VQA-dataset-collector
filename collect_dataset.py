@@ -38,9 +38,12 @@ MAX_IMAGES_PER_ITEM = 20
 MIN_IMAGE_DIM       = 400   # skip images smaller than this in either dimension (px)
 
 # Delays (seconds) — be polite
-SLEEP_API_SEARCH = 3.0
-SLEEP_DOWNLOAD   = 2.0
-SLEEP_JITTER     = 1.0
+# Wikimedia CDN rate-limits bulk anonymous downloads aggressively.
+# Use --source ddg to skip Wikimedia and avoid 429s entirely.
+SLEEP_API_SEARCH    = 5.0   # between Wikimedia API calls
+SLEEP_WM_DOWNLOAD   = 5.0   # between Wikimedia image downloads (strict CDN)
+SLEEP_DDG_DOWNLOAD  = 2.0   # between DDG image downloads (more permissive)
+SLEEP_JITTER        = 1.0
 
 # Retry settings for 429 / 503
 MAX_RETRIES      = 5
@@ -592,7 +595,7 @@ def collect(
                         downloaded += 1
                         continue
 
-                    _jittered_sleep(SLEEP_DOWNLOAD)
+                    _jittered_sleep(SLEEP_WM_DOWNLOAD)
                     data = download_bytes(url)
                     if not data:
                         continue
@@ -710,7 +713,7 @@ def collect(
                         downloaded += 1
                         continue
 
-                    _jittered_sleep(SLEEP_DOWNLOAD)
+                    _jittered_sleep(SLEEP_DDG_DOWNLOAD)
                     data = download_bytes(url)
                     if not data:
                         continue
@@ -770,7 +773,7 @@ def collect(
                             downloaded += 1
                             continue
 
-                        _jittered_sleep(SLEEP_DOWNLOAD)
+                        _jittered_sleep(SLEEP_DDG_DOWNLOAD)
                         data = download_bytes(url)
                         if not data:
                             continue
