@@ -250,6 +250,7 @@ ITEMS = {
         "Kandagi":        "Ilkal Kandagi saree Karnataka",
         "Kanikachipuram": "",
         "Muga and Eri silk weaving":    "",
+        "acacacascascac":   "",
     },
     "traditional_clothing_embroidery": {
         "Zardosi":        "Zardosi embroidery gold thread India",
