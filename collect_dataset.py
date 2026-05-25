@@ -100,7 +100,7 @@ ITEMS = {
         "Ghoomar":       "Ghoomar folk dance Rajasthan",
         "Kalbelia":      "Kalbelia dance performance Rajasthan",
         "Garba":         "Garba dance Gujarat Navratri",
-        "Dandiya":       "Dandiya Raas sticks Gujarat dance",
+        "Dandiya":       "Dandiya Raas Gujarat dance festival",
         "Lavani":        "Lavani folk dance Maharashtra performance",
         "Bihu":          "Bihu dance performance Assam",
         "Theyyam":       "Theyyam ritual dance Kerala",
@@ -109,7 +109,7 @@ ITEMS = {
         "Cheraw":        "Cheraw bamboo dance Mizoram",
         "Pung Cholom":   "Pung Cholom drum dance Manipur",
         "Giddha": "Giddha folk dance Punjab women dance",
-        "Cheraw"  :      "",
+        "Cheraw"  :      "Cheraw folk dance mizoram",
     },
     "food": {
         "Dal Makhani":           "Dal Makhani Punjab food",
