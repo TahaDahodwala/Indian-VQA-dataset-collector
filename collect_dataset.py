@@ -161,7 +161,6 @@ ITEMS = {
         "Rasabali":              "Rasabali Odisha sweet",
         "Masor Tenga":           "Masor Tenga Assam fish curry",
         "Axone (fermented soy)": "Axone fermented soy Nagaland food",
-        "Rice Beer, , ":         "Rice Beer Northeast India beverage",
         "Smoked meats":          "Smoked meats Northeast India food",
         "Pork with Bamboo Shoots":"Pork with Bamboo Shoots Northeast India food",
         "Gundruk Phagshapa":     "Gundruk Phagshapa Sikkim food",
