@@ -182,7 +182,6 @@ ITEMS = {
         "Dal Baati Churma":      "Dal Baati Churma Rajasthan food",
         "Chole Bhature":         "Chole Bhature Indian food",
         "Dhokla":               "Dhokla Gujarat snack",
-        "Vada Pav":              "Vada Pav Mumbai street food",
         "Vindaloo":              "Vindaloo Goa pork curry",
         "Modak":                 "Modak sweet Maharashtra",
         "Masala Dosa":           "Masala Dosa South Indian breakfast",
@@ -431,8 +430,12 @@ def _request_with_backoff(method: str, url: str, **kwargs) -> requests.Response:
 
     SSL errors (bad cert, hostname mismatch) are permanent — they are raised
     immediately so the caller can skip the URL rather than retrying uselessly.
+    
+    Connection reset/abort errors are treated as temporary failures — skip after
+    2-3 attempts rather than retrying indefinitely.
     """
     delay = RETRY_BASE_DELAY
+    connection_error_count = 0
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = SESSION.request(method, url, **kwargs)
@@ -451,6 +454,17 @@ def _request_with_backoff(method: str, url: str, **kwargs) -> requests.Response:
             print(f"  [SSL ERROR — skipping] {e}")
             raise
         except requests.exceptions.ConnectionError as e:
+            connection_error_count += 1
+            error_str = str(e).lower()
+            # Connection reset/abort errors — skip after 2 attempts
+            if "reset" in error_str or "aborted" in error_str or "10054" in str(e):
+                if connection_error_count >= 2:
+                    print(f"  [CONNECTION RESET — giving up after {connection_error_count} attempts]")
+                    raise
+                print(f"  [CONNECTION RESET] {e} — retry {connection_error_count}/2…")
+                time.sleep(5)  # shorter delay for connection resets
+                continue
+            # Other connection errors — retry with backoff
             print(f"  [CONNECTION ERROR] {e} — retrying in {delay:.0f}s…")
             time.sleep(delay)
             delay *= 2
@@ -478,7 +492,12 @@ def wm_search(query: str, limit: int = 30) -> list[dict]:
         pages = r.json().get("query", {}).get("pages", {})
         return list(pages.values())
     except Exception as e:
-        print(f"  [WM API ERROR] {e}")
+        error_msg = str(e).lower()
+        if "rate" in error_msg or "429" in error_msg or "503" in error_msg:
+            print(f"  ⚠️  [WIKIMEDIA RATE LIMIT] {e}")
+            print(f"      Try again in ~5-10 minutes or use: python collect_dataset.py --source ddg")
+        else:
+            print(f"  [WIKIMEDIA API ERROR] {e}")
         return []
 
 
@@ -581,8 +600,24 @@ def ddg_search(query: str, limit: int = 50) -> list[dict]:
             max_results=limit,
         ))
     except Exception as e:
-        print(f"  [DDG ERROR] {e}")
-        return []
+        error_msg = str(e).lower()
+        # Detect rate limiting
+        if "rate" in error_msg or "limit" in error_msg or "429" in error_msg or "503" in error_msg:
+            print(f"\n  ⚠️  [DDG RATE LIMIT] Hit search rate limit!")
+            print(f"      Error: {e}")
+            print(f"      ➜ Wait ~30-60 minutes before running this script again")
+            print(f"      ➜ Or use: python collect_dataset.py --source wikimedia")
+            print(f"         to skip DDG and use only Wikimedia\n")
+            return []
+        # Detect connection errors
+        elif "connection" in error_msg or "timeout" in error_msg or "resolve" in error_msg:
+            print(f"  ⚠️  [DDG CONNECTION ERROR] {e}")
+            print(f"      Check your internet connection and try again in a few minutes\n")
+            return []
+        # Generic error
+        else:
+            print(f"  [DDG ERROR] {e}")
+            return []
 
 
 # ── COMMON UTILS ──────────────────────────────────────────────────────────────
@@ -599,12 +634,29 @@ def count_existing(item_dir: Path) -> int:
 
 
 def download_bytes(url: str) -> bytes | None:
-    """Download raw bytes. Returns None on failure."""
+    """Download raw bytes. Returns None on failure, skipping to next image."""
     try:
         r = _request_with_backoff("GET", url, timeout=30, stream=True)
         return r.content
+    except requests.exceptions.Timeout:
+        print(f"  [SKIP] Timeout downloading — moving to next image")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        error_str = str(e).lower()
+        if "reset" in error_str or "aborted" in error_str or "10054" in str(e):
+            print(f"  [SKIP] Connection reset by host — moving to next image")
+        else:
+            print(f"  [SKIP] Connection error: {e} — moving to next image")
+        return None
+    except requests.exceptions.HTTPError as e:
+        print(f"  [SKIP] HTTP error {e} — moving to next image")
+        return None
+    except RuntimeError as e:
+        # Raised by _request_with_backoff after max retries
+        print(f"  [SKIP] Download failed after retries — moving to next image")
+        return None
     except Exception as e:
-        print(f"  [DOWNLOAD ERROR] {e}")
+        print(f"  [SKIP] Download error: {e} — moving to next image")
         return None
 
 
@@ -678,6 +730,15 @@ def collect(
 
     metadata    = load_json(META_FILE,    default={})
     seen_hashes = set(load_json(HASHES_FILE, default=[]))
+    
+    # Build set of already-downloaded URLs from metadata (persistent across restarts)
+    seen_urls = set()
+    for entry in metadata.values():
+        if isinstance(entry, dict) and "url" in entry:
+            seen_urls.add(entry["url"])
+    
+    print(f"[INFO] Loaded {len(seen_urls)} previously downloaded URLs")
+    print(f"[INFO] Loaded {len(seen_hashes)} previously seen image hashes\n")
 
     # if source == "flickr" and not FLICKR_API_KEY:
     #     print("[ERROR] FLICKR_API_KEY is not set. Edit the script and add your key.")
@@ -714,61 +775,72 @@ def collect(
                     if downloaded >= MAX_IMAGES_PER_ITEM:
                         break
 
-                    if not wm_allowed_license(page):
-                        continue
+                    try:
+                        if not wm_allowed_license(page):
+                            continue
 
-                    mime = wm_mime(page)
-                    if not mime.startswith("image/") or mime in ("image/svg+xml", "image/tiff"):
-                        continue
+                        mime = wm_mime(page)
+                        if not mime.startswith("image/") or mime in ("image/svg+xml", "image/tiff"):
+                            continue
 
-                    # Size filter — skip thumbnails / tiny images
-                    # If dims are unknown (0,0), let it through
-                    w, h = wm_dims(page)
-                    if w and h and (w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM):
-                        continue
+                        # Size filter — skip thumbnails / tiny images
+                        # If dims are unknown (0,0), let it through
+                        w, h = wm_dims(page)
+                        if w and h and (w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM):
+                            continue
 
-                    url = wm_url(page)
-                    if not url:
-                        continue
+                        url = wm_url(page)
+                        if not url:
+                            continue
+                        
+                        # Skip if URL already downloaded
+                        if url in seen_urls:
+                            print(f"  [SKIP] URL already downloaded (from another item/category)")
+                            continue
 
-                    ext = "." + url.split(".")[-1].split("?")[0].lower()
-                    if ext not in IMAGE_EXTENSIONS:
-                        continue
+                        ext = "." + url.split(".")[-1].split("?")[0].lower()
+                        if ext not in IMAGE_EXTENSIONS:
+                            continue
 
-                    filename = f"{safe_label}_{downloaded + 1:03d}{ext}"
-                    filepath = item_dir / filename
+                        filename = f"{safe_label}_{downloaded + 1:03d}{ext}"
+                        filepath = item_dir / filename
 
-                    if filepath.exists():
+                        if filepath.exists():
+                            downloaded += 1
+                            continue
+
+                        _jittered_sleep(SLEEP_WM_DOWNLOAD)
+                        data = download_bytes(url)
+                        if not data:
+                            continue
+
+                        image_hash = md5(data)
+                        if image_hash in seen_hashes:
+                            print(f"  [DUPE] skipping duplicate (same image content)")
+                            continue
+
+                        filepath.write_bytes(data)
+                        seen_hashes.add(image_hash)
+                        seen_urls.add(url)  # Flag this URL as downloaded
+
+                        lic = wm_license(page)
+                        metadata[f"{category}/{label}/{filename}"] = {
+                            "category": category,
+                            "label":    label,
+                            "filename": filename,
+                            "source":   "wikimedia",
+                            "url":      url,
+                            "license":  lic,
+                            "artist":   wm_artist(page),
+                            "query":    query,
+                            "md5":      image_hash,
+                        }
                         downloaded += 1
+                        print(f"  ✓ [WM] {filename}  [{lic}]")
+                    except Exception as e:
+                        # Skip this image and continue to the next
+                        print(f"  [SKIP] Error processing Wikimedia image: {e}")
                         continue
-
-                    _jittered_sleep(SLEEP_WM_DOWNLOAD)
-                    data = download_bytes(url)
-                    if not data:
-                        continue
-
-                    image_hash = md5(data)
-                    if image_hash in seen_hashes:
-                        print(f"  [DUPE] skipping duplicate")
-                        continue
-
-                    filepath.write_bytes(data)
-                    seen_hashes.add(image_hash)
-
-                    lic = wm_license(page)
-                    metadata[f"{category}/{label}/{filename}"] = {
-                        "category": category,
-                        "label":    label,
-                        "filename": filename,
-                        "source":   "wikimedia",
-                        "url":      url,
-                        "license":  lic,
-                        "artist":   wm_artist(page),
-                        "query":    query,
-                        "md5":      image_hash,
-                    }
-                    downloaded += 1
-                    print(f"  ✓ [WM] {filename}  [{lic}]")
 
             # ── Flickr fallback (triggered only when Wikimedia comes up short) ─
             # if source in ("flickr", "both") and downloaded < MAX_IMAGES_PER_ITEM:
@@ -838,77 +910,28 @@ def collect(
                     if downloaded >= MAX_IMAGES_PER_ITEM:
                         break
 
-                    url = result.get("image")
-                    if not url:
-                        continue
-
-                    # DDG often returns Wikimedia /thumb/ URLs which reject non-standard
-                    # sizes with 400. Convert to the canonical full-resolution URL.
-                    if "upload.wikimedia.org" in url and "/thumb/" in url:
-                        base, rest = url.split("/thumb/", 1)
-                        # rest = "hash1/hash2/file.jpg/390px-file.jpg" — drop last segment
-                        path_no_size = rest.rsplit("/", 1)[0]
-                        url = f"{base}/{path_no_size}"
-
-                    raw_ext = "." + url.split("?")[0].rsplit(".", 1)[-1].lower()
-                    ext     = raw_ext if raw_ext in IMAGE_EXTENSIONS else ".jpg"
-
-                    filename = f"{safe_label}_ddg_{downloaded + 1:03d}{ext}"
-                    filepath = item_dir / filename
-
-                    if filepath.exists():
-                        downloaded += 1
-                        continue
-
-                    _jittered_sleep(SLEEP_DDG_DOWNLOAD)
-                    data = download_bytes(url)
-                    if not data:
-                        continue
-
-                    image_hash = md5(data)
-                    if image_hash in seen_hashes:
-                        print(f"  [DUPE] skipping duplicate")
-                        continue
-
-                    filepath.write_bytes(data)
-                    seen_hashes.add(image_hash)
-
-                    metadata[f"{category}/{label}/{filename}"] = {
-                        "category": category,
-                        "label":    label,
-                        "filename": filename,
-                        "source":   f"ddg/{result.get('source', 'unknown')}",
-                        "url":      url,
-                        "license":  "CC (Share)",
-                        "artist":   result.get("title", "unknown"),
-                        "query":    query,
-                        "md5":      image_hash,
-                    }
-                    downloaded += 1
-                    print(f"  ✓ [DDG] {filename}  via {result.get('source', '?')}")
-
-            # ── DDG retry with shorter query if still underfilled ─────────────
-            if source in ("ddg", "both") and downloaded < MAX_IMAGES_PER_ITEM:
-                # Build a shorter fallback query (first 2–3 words of the original)
-                short_query = " ".join(query.split()[:3])
-                if short_query != query:
-                    print(f"  [DDG retry] still {downloaded}/{MAX_IMAGES_PER_ITEM},"
-                          f" trying shorter query: '{short_query}'…")
-                    time.sleep(2)
-                    results2 = ddg_search(short_query, limit=50)
-
-                    for result in results2:
-                        if downloaded >= MAX_IMAGES_PER_ITEM:
-                            break
-
+                    try:
                         url = result.get("image")
                         if not url:
                             continue
 
+                        # Skip if URL already downloaded
+                        if url in seen_urls:
+                            print(f"  [SKIP] URL already downloaded (from another item/category)")
+                            continue
+
+                        # DDG often returns Wikimedia /thumb/ URLs which reject non-standard
+                        # sizes with 400. Convert to the canonical full-resolution URL.
                         if "upload.wikimedia.org" in url and "/thumb/" in url:
                             base, rest = url.split("/thumb/", 1)
+                            # rest = "hash1/hash2/file.jpg/390px-file.jpg" — drop last segment
                             path_no_size = rest.rsplit("/", 1)[0]
                             url = f"{base}/{path_no_size}"
+                        
+                        # Check again after URL normalization
+                        if url in seen_urls:
+                            print(f"  [SKIP] URL already downloaded (normalized)")
+                            continue
 
                         raw_ext = "." + url.split("?")[0].rsplit(".", 1)[-1].lower()
                         ext     = raw_ext if raw_ext in IMAGE_EXTENSIONS else ".jpg"
@@ -927,11 +950,12 @@ def collect(
 
                         image_hash = md5(data)
                         if image_hash in seen_hashes:
-                            print(f"  [DUPE] skipping duplicate")
+                            print(f"  [DUPE] skipping duplicate (same image content)")
                             continue
 
                         filepath.write_bytes(data)
                         seen_hashes.add(image_hash)
+                        seen_urls.add(url)  # Flag this URL as downloaded
 
                         metadata[f"{category}/{label}/{filename}"] = {
                             "category": category,
@@ -939,13 +963,93 @@ def collect(
                             "filename": filename,
                             "source":   f"ddg/{result.get('source', 'unknown')}",
                             "url":      url,
-                            "license":  "unknown",
+                            "license":  "CC (Share)",
                             "artist":   result.get("title", "unknown"),
-                            "query":    short_query,
+                            "query":    query,
                             "md5":      image_hash,
                         }
                         downloaded += 1
-                        print(f"  ✓ [DDG2] {filename}  via {result.get('source', '?')}")
+                        print(f"  ✓ [DDG] {filename}  via {result.get('source', '?')}")
+                    except Exception as e:
+                        # Skip this image and continue to next
+                        print(f"  [SKIP] Error processing DDG image: {e}")
+                        continue
+
+            # ── DDG retry with shorter query if still underfilled ─────────────
+            if source in ("ddg", "both") and downloaded < MAX_IMAGES_PER_ITEM:
+                # Build a shorter fallback query (first 2–3 words of the original)
+                short_query = " ".join(query.split()[:3])
+                if short_query != query:
+                    print(f"  [DDG retry] still {downloaded}/{MAX_IMAGES_PER_ITEM},"
+                          f" trying shorter query: '{short_query}'…")
+                    time.sleep(2)
+                    results2 = ddg_search(short_query, limit=50)
+
+                    for result in results2:
+                        if downloaded >= MAX_IMAGES_PER_ITEM:
+                            break
+
+                        try:
+                            url = result.get("image")
+                            if not url:
+                                continue
+
+                            # Skip if URL already downloaded
+                            if url in seen_urls:
+                                print(f"  [SKIP] URL already downloaded (retry)")
+                                continue
+
+                            if "upload.wikimedia.org" in url and "/thumb/" in url:
+                                base, rest = url.split("/thumb/", 1)
+                                path_no_size = rest.rsplit("/", 1)[0]
+                                url = f"{base}/{path_no_size}"
+
+                            # Check again after URL normalization
+                            if url in seen_urls:
+                                print(f"  [SKIP] URL already downloaded (normalized, retry)")
+                                continue
+
+                            raw_ext = "." + url.split("?")[0].rsplit(".", 1)[-1].lower()
+                            ext     = raw_ext if raw_ext in IMAGE_EXTENSIONS else ".jpg"
+
+                            filename = f"{safe_label}_ddg_{downloaded + 1:03d}{ext}"
+                            filepath = item_dir / filename
+
+                            if filepath.exists():
+                                downloaded += 1
+                                continue
+
+                            _jittered_sleep(SLEEP_DDG_DOWNLOAD)
+                            data = download_bytes(url)
+                            if not data:
+                                continue
+
+                            image_hash = md5(data)
+                            if image_hash in seen_hashes:
+                                print(f"  [DUPE] skipping duplicate")
+                                continue
+
+                            filepath.write_bytes(data)
+                            seen_hashes.add(image_hash)
+                            seen_urls.add(url)  # Flag this URL as downloaded
+
+                            metadata[f"{category}/{label}/{filename}"] = {
+                                "category": category,
+                                "label":    label,
+                                "filename": filename,
+                                "source":   f"ddg/{result.get('source', 'unknown')}",
+                                "url":      url,
+                                "license":  "unknown",
+                                "artist":   result.get("title", "unknown"),
+                                "query":    short_query,
+                                "md5":      image_hash,
+                            }
+                            downloaded += 1
+                            print(f"  ✓ [DDG2] {filename}  via {result.get('source', '?')}")
+                        except Exception as e:
+                            # Skip this image and continue to next
+                            print(f"  [SKIP] Error processing DDG image: {e}")
+                            continue
 
             # Persist after every label so a crash loses at most one item
             save_json(META_FILE,    metadata)
