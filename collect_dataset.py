@@ -465,6 +465,13 @@ def _request_with_backoff(method: str, url: str, **kwargs) -> requests.Response:
                 time.sleep(5)  # shorter delay for connection resets
                 continue
             # Other connection errors — retry with backoff
+            if "reset" in error_str or "abroted" in error_str or "11002" in str(e):
+                if connection_error_count >= 2:
+                    print(f"  [CONNECTOION ERROR - giving up after {connection_error_count} attempts]")
+                    raise
+                print(f"    [CONNECTION RESET] {e} - retry {connection_error_count}/2...")
+                time.sleep(5)
+                continue
             print(f"  [CONNECTION ERROR] {e} — retrying in {delay:.0f}s…")
             time.sleep(delay)
             delay *= 2
@@ -679,6 +686,26 @@ def save_json(path: Path, data) -> None:
     tmp.replace(path)  # atomic on same filesystem
 
 
+# ── URLS_FILE: Track downloaded URLs separately for easier dedup ────────────
+
+URLS_FILE = OUTPUT_DIR / "downloaded_urls.json"
+
+def load_urls_file() -> set:
+    """Load set of already-downloaded URLs from persistent file."""
+    if URLS_FILE.exists():
+        try:
+            with open(URLS_FILE, encoding="utf-8") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return set()
+    return set()
+
+
+def save_urls_file(seen_urls: set) -> None:
+    """Persist all downloaded URLs to file."""
+    save_json(URLS_FILE, list(seen_urls))
+
+
 # ── STATUS REPORT ─────────────────────────────────────────────────────────────
 
 def status_report(filter_category: str | None = None) -> None:
@@ -730,12 +757,7 @@ def collect(
 
     metadata    = load_json(META_FILE,    default={})
     seen_hashes = set(load_json(HASHES_FILE, default=[]))
-    
-    # Build set of already-downloaded URLs from metadata (persistent across restarts)
-    seen_urls = set()
-    for entry in metadata.values():
-        if isinstance(entry, dict) and "url" in entry:
-            seen_urls.add(entry["url"])
+    seen_urls   = load_urls_file()  # Load from dedicated URLs file
     
     print(f"[INFO] Loaded {len(seen_urls)} previously downloaded URLs")
     print(f"[INFO] Loaded {len(seen_hashes)} previously seen image hashes\n")
@@ -837,6 +859,11 @@ def collect(
                         }
                         downloaded += 1
                         print(f"  ✓ [WM] {filename}  [{lic}]")
+                        
+                        # Persist after every image to prevent re-downloading duplicates
+                        save_json(META_FILE, metadata)
+                        save_json(HASHES_FILE, list(seen_hashes))
+                        save_urls_file(seen_urls)
                     except Exception as e:
                         # Skip this image and continue to the next
                         print(f"  [SKIP] Error processing Wikimedia image: {e}")
@@ -970,6 +997,11 @@ def collect(
                         }
                         downloaded += 1
                         print(f"  ✓ [DDG] {filename}  via {result.get('source', '?')}")
+                        
+                        # Persist after every image to prevent re-downloading duplicates
+                        save_json(META_FILE, metadata)
+                        save_json(HASHES_FILE, list(seen_hashes))
+                        save_urls_file(seen_urls)
                     except Exception as e:
                         # Skip this image and continue to next
                         print(f"  [SKIP] Error processing DDG image: {e}")
@@ -1046,6 +1078,11 @@ def collect(
                             }
                             downloaded += 1
                             print(f"  ✓ [DDG2] {filename}  via {result.get('source', '?')}")
+                            
+                            # Persist after every image to prevent re-downloading duplicates
+                            save_json(META_FILE, metadata)
+                            save_json(HASHES_FILE, list(seen_hashes))
+                            save_urls_file(seen_urls)
                         except Exception as e:
                             # Skip this image and continue to next
                             print(f"  [SKIP] Error processing DDG image: {e}")
@@ -1054,6 +1091,7 @@ def collect(
             # Persist after every label so a crash loses at most one item
             save_json(META_FILE,    metadata)
             save_json(HASHES_FILE,  list(seen_hashes))
+            save_urls_file(seen_urls)
 
             final = count_existing(item_dir)
             if final < MAX_IMAGES_PER_ITEM:
