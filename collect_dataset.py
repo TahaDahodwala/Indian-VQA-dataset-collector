@@ -453,6 +453,15 @@ def _request_with_backoff(method: str, url: str, **kwargs) -> requests.Response:
             # SSL failures (bad cert, hostname mismatch) are permanent — skip.
             print(f"  [SSL ERROR — skipping] {e}")
             raise
+        except requests.exceptions.ConnectTimeout as e:
+            # Treat connect timeouts as transient but give up quickly
+            connection_error_count += 1
+            if connection_error_count >= 2:
+                print(f"  [CONNECT TIMEOUT — giving up after {connection_error_count} attempts] {e}")
+                raise
+            print(f"  [CONNECT TIMEOUT] {e} — retry {connection_error_count}/2…")
+            time.sleep(5)
+            continue
         except requests.exceptions.ConnectionError as e:
             connection_error_count += 1
             error_str = str(e).lower()
@@ -465,13 +474,6 @@ def _request_with_backoff(method: str, url: str, **kwargs) -> requests.Response:
                 time.sleep(5)  # shorter delay for connection resets
                 continue
             # Other connection errors — retry with backoff
-            if "reset" in error_str or "abroted" in error_str or "11002" in str(e):
-                if connection_error_count >= 2:
-                    print(f"  [CONNECTOION ERROR - giving up after {connection_error_count} attempts]")
-                    raise
-                print(f"    [CONNECTION RESET] {e} - retry {connection_error_count}/2...")
-                time.sleep(5)
-                continue
             print(f"  [CONNECTION ERROR] {e} — retrying in {delay:.0f}s…")
             time.sleep(delay)
             delay *= 2
@@ -645,6 +647,9 @@ def download_bytes(url: str) -> bytes | None:
     try:
         r = _request_with_backoff("GET", url, timeout=30, stream=True)
         return r.content
+    except requests.exceptions.ConnectTimeout:
+        print(f"  [SKIP] Connection timed out (connect) — moving to next image")
+        return None
     except requests.exceptions.Timeout:
         print(f"  [SKIP] Timeout downloading — moving to next image")
         return None
